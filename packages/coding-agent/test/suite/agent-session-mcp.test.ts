@@ -299,6 +299,35 @@ describe("AgentSession MCP integration", () => {
 		expect(getMessageText(result)).toBe("direct guide\ndirect faq");
 	});
 
+	// Regression: #10239.
+	it.each([false, true])("keeps colliding codemode names distinct (reverse: %s)", async (reverse) => {
+		const tools = [
+			{ name: "read-file", description: "dashed", inputSchema: { type: "object", properties: {} } },
+			{ name: "read_file", description: "underscored", inputSchema: { type: "object", properties: {} } },
+		];
+		if (reverse) tools.reverse();
+		const { harness, calls } = await setup("codemode", () => tools);
+		harness.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxToolCall("codemode", {
+						code: `for (const query of ["dashed", "underscored"]) {
+							const [match] = await searchTools(query, { limit: 1 });
+							await tools[match.name]({});
+						}`,
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("done"),
+		]);
+
+		await harness.session.prompt("call both tools");
+
+		expect(toolResult(harness, "codemode").isError).toBe(false);
+		expect(calls).toEqual(["read-file:{}", "read_file:{}"]);
+	});
+
 	it.each(["direct", "codemode"] as const)(
 		"withdraws and restores %s MCP tools the server changes",
 		async (exposure) => {

@@ -26,6 +26,7 @@
  */
 
 import { join, resolve } from "node:path";
+import { toCodemodeIdentifier } from "@earendil-works/pi-codemode/declarations";
 import type { SelectItem } from "@earendil-works/pi-tui";
 import type { TSchema } from "typebox";
 import { getAgentDir } from "../../config.ts";
@@ -229,7 +230,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			return serverLog;
 		};
 
-		/** pi tool name to the `<server>\0<tool>` it was assigned to, so names stay unique and stable. */
+		/** Codemode identifier to the `<server>\0<tool>` it was assigned to, so aliases stay unique and stable. */
 		const toolOwners = new Map<string, string>();
 		/** Tool names currently offered by each server. */
 		const serverTools = new Map<string, Set<string>>();
@@ -250,10 +251,10 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			const current = new Set<string>();
 			const assignName = (tool: string, owner: string) => {
 				const name = createMcpToolName(server, tool, (candidate) => {
-					const existing = toolOwners.get(candidate);
+					const existing = toolOwners.get(toCodemodeIdentifier(candidate));
 					return (existing !== undefined && existing !== owner) || current.has(candidate);
 				});
-				toolOwners.set(name, owner);
+				toolOwners.set(toCodemodeIdentifier(name), owner);
 				current.add(name);
 				return name;
 			};

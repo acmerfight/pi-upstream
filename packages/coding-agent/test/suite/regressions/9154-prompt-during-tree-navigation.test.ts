@@ -30,21 +30,15 @@ describe("issue #9154: prompt during tree navigation", () => {
 	});
 
 	it("rejects a prompt while branch summarization is in progress", async () => {
-		let markSummaryStarted = () => {};
-		const summaryStarted = new Promise<void>((resolve) => {
-			markSummaryStarted = resolve;
-		});
-		let releaseSummary = () => {};
-		const summaryReleased = new Promise<void>((resolve) => {
-			releaseSummary = resolve;
-		});
+		const summaryStarted = deferred();
+		const summaryReleased = deferred();
 
 		const harness = await createHarness({
 			extensionFactories: [
 				(pi) => {
 					pi.on("session_before_tree", async () => {
-						markSummaryStarted();
-						await summaryReleased;
+						summaryStarted.resolve();
+						await summaryReleased.promise;
 						return { summary: { summary: "abandoned branch summary" } };
 					});
 				},
@@ -52,24 +46,11 @@ describe("issue #9154: prompt during tree navigation", () => {
 		});
 		harnesses.push(harness);
 
-		const timestamp = Date.now();
-		const targetId = harness.sessionManager.appendMessage({
-			role: "user",
-			content: [{ type: "text", text: "first prompt" }],
-			timestamp: timestamp - 1500,
-		});
-		harness.sessionManager.appendMessage(fauxAssistantMessage("first response", { timestamp: timestamp - 1000 }));
-		harness.sessionManager.appendMessage({
-			role: "user",
-			content: [{ type: "text", text: "abandoned prompt" }],
-			timestamp: timestamp - 500,
-		});
-		harness.sessionManager.appendMessage(fauxAssistantMessage("abandoned response", { timestamp }));
-		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+		const targetId = seedHistory(harness);
 		harness.setResponses([fauxAssistantMessage("unexpected response")]);
 
 		const navigationPromise = harness.session.navigateTree(targetId, { summarize: true });
-		await summaryStarted;
+		await summaryStarted.promise;
 
 		const preflightResult = vi.fn();
 		let promptError: unknown;
@@ -81,7 +62,7 @@ describe("issue #9154: prompt during tree navigation", () => {
 		} catch (error) {
 			promptError = error;
 		} finally {
-			releaseSummary();
+			summaryReleased.resolve();
 			await navigationPromise;
 		}
 
@@ -170,6 +151,102 @@ describe("issue #9154: prompt during tree navigation", () => {
 			await expect(harness.session.navigateTree(targetId)).resolves.toMatchObject({ cancelled: false });
 		},
 	);
+
+	it("keeps navigation blocked when another prompt finishes preflight first", async () => {
+		const started = deferred();
+		const released = deferred();
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", async (event) => {
+						if (event.text === "waiting prompt") {
+							started.resolve();
+							await released.promise;
+						}
+						return { action: "handled" };
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		const targetId = seedHistory(harness);
+		const waiting = harness.session.prompt("waiting prompt");
+		await started.promise;
+		try {
+			await harness.session.prompt("handled immediately");
+			await expect(harness.session.navigateTree(targetId)).rejects.toThrow(
+				"Wait for the current response to finish before navigating the session tree.",
+			);
+		} finally {
+			released.resolve();
+			await waiting;
+		}
+		await expect(harness.session.navigateTree(targetId)).resolves.toMatchObject({ cancelled: false });
+	});
+
+	it("allows a prompt from session_tree after the selected context is installed", async () => {
+		const errors: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_tree", async () => {
+						await harness.session.sendUserMessage("continue on the selected branch");
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({ onError: (error) => errors.push(error.error) });
+		const targetId = seedHistory(harness);
+		harness.setResponses([fauxAssistantMessage("continued")]);
+		await harness.session.navigateTree(targetId);
+		expect(errors).toEqual([]);
+		expect(getUserTexts(harness)).toEqual(["first prompt", "continue on the selected branch"]);
+		expect(harness.session.getLastAssistantText()).toBe("continued");
+	});
+
+	it("does not clear a new navigation started from session_tree", async () => {
+		const started = deferred();
+		const released = deferred();
+		let nextTargetId = "";
+		let continuation: Promise<unknown> | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_tree", async (event) => {
+						if (event.preparation.targetId === nextTargetId) {
+							started.resolve();
+							await released.promise;
+						}
+					});
+					pi.on("session_tree", () => {
+						continuation ??= harness.session.navigateTree(nextTargetId).then(
+							() => undefined,
+							(error: unknown) => error,
+						);
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		const targetId = seedHistory(harness);
+		nextTargetId = harness.sessionManager.getLeafId()!;
+		try {
+			await harness.session.navigateTree(targetId);
+			expect(continuation).toBeDefined();
+			await Promise.race([started.promise, continuation]);
+			expect(harness.session.isCompacting).toBe(true);
+			await expect(harness.session.prompt("must wait for the second navigation")).rejects.toThrow(
+				"compaction is in progress",
+			);
+		} finally {
+			released.resolve();
+			await continuation;
+		}
+		expect(await continuation).toBeUndefined();
+		expect(harness.sessionManager.getLeafId()).toBe(nextTargetId);
+		expect(harness.session.isCompacting).toBe(false);
+	});
 
 	it.each(["command", "agent_settled"] as const)("allows navigation from an extension %s", async (event) => {
 		let targetId = "";

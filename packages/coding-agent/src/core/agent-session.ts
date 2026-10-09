@@ -4035,7 +4035,8 @@ export class AgentSession {
 		};
 
 		// Set up abort controller for summarization
-		this._branchSummaryAbortController = new AbortController();
+		const abortController = new AbortController();
+		this._branchSummaryAbortController = abortController;
 
 		try {
 			let extensionSummary: { summary: string; details?: unknown; usage?: Usage } | undefined;
@@ -4046,7 +4047,7 @@ export class AgentSession {
 				const result = (await this._extensionRunner.emit({
 					type: "session_before_tree",
 					preparation,
-					signal: this._branchSummaryAbortController.signal,
+					signal: abortController.signal,
 				})) as SessionBeforeTreeResult | undefined;
 
 				if (result?.cancel) {
@@ -4075,7 +4076,7 @@ export class AgentSession {
 			let summaryDetails: unknown;
 			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
-				const signal = this._branchSummaryAbortController.signal;
+				const signal = abortController.signal;
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
 				const result = await generateBranchSummary(entriesToSummarize, {
 					...(await this._getSummarizationRequestAuth(this.model!, signal)),
@@ -4158,6 +4159,8 @@ export class AgentSession {
 			this._restoreToolsFromTranscript();
 
 			// Emit session_tree event
+			// The selected context is installed; handlers may now submit a prompt or navigate again.
+			this._branchSummaryAbortController = undefined;
 			await this._extensionRunner.emit({
 				type: "session_tree",
 				newLeafId: this.sessionManager.getLeafId(),
@@ -4170,7 +4173,9 @@ export class AgentSession {
 
 			return { editorText, cancelled: false, summaryEntry };
 		} finally {
-			this._branchSummaryAbortController = undefined;
+			if (this._branchSummaryAbortController === abortController) {
+				this._branchSummaryAbortController = undefined;
+			}
 			this._resolveIdleWaitIfIdle();
 		}
 	}

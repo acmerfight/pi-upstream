@@ -7,28 +7,15 @@
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
-	type Context,
-	EventStream,
+	type AssistantMessageEventStream,
+	createAssistantMessageEventStream,
 	type Model,
 	parseStreamingJson,
 	type SimpleStreamOptions,
 	type StopReason,
 	type ToolCall,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
-
-// Create stream class matching ProxyMessageEventStream
-class ProxyMessageEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor() {
-		super(
-			(event) => event.type === "done" || event.type === "error",
-			(event) => {
-				if (event.type === "done") return event.message;
-				if (event.type === "error") return event.error;
-				throw new Error("Unexpected event type");
-			},
-		);
-	}
-}
 
 /**
  * Proxy event types - server sends these with partial field stripped to reduce bandwidth.
@@ -117,8 +104,12 @@ function buildProxyRequestOptions(options: ProxyStreamOptions): ProxySerializabl
 	};
 }
 
-export function streamProxy(model: Model<any>, context: Context, options: ProxyStreamOptions): ProxyMessageEventStream {
-	const stream = new ProxyMessageEventStream();
+export function streamProxy(
+	model: Model<any>,
+	context: TranscriptContext,
+	options: ProxyStreamOptions,
+): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
 
 	(async () => {
 		// Initialize the partial message that we'll build up from events

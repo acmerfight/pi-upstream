@@ -61,19 +61,22 @@ describe("regression #9124: runtime disposal during tool execution", () => {
 
 		const prompt = runtime.session.prompt("run tool");
 		await toolStarted;
-		await runtime.dispose();
-		await prompt;
-
-		const messages = harness.sessionManager
-			.getEntries()
-			.filter((entry) => entry.type === "message")
-			.map((entry) => entry.message)
-			.filter((message) => message.role !== "system");
-		expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "toolResult", "assistant"]);
-		expect(messages[2]).toMatchObject({
-			role: "toolResult",
-			content: [{ type: "text", text: "Operation aborted" }],
-			isError: true,
-		});
+		try {
+			await runtime.dispose();
+			// #9124: disposal itself must settle persistence; awaiting the prompt must not be necessary.
+			const messages = harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "message")
+				.map((entry) => entry.message)
+				.filter((message) => message.role !== "system");
+			expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "toolResult", "assistant"]);
+			expect(messages[2]).toMatchObject({
+				role: "toolResult",
+				content: [{ type: "text", text: "Operation aborted" }],
+				isError: true,
+			});
+		} finally {
+			await prompt;
+		}
 	});
 });

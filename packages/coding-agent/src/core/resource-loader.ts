@@ -117,14 +117,37 @@ export function isBuiltinExtension(input: InlineExtension): input is BuiltinExte
  * with another extension. For example, a third-party MCP extension that registers `/mcp` replaces
  * the built-in MCP extension instead of both connecting the same servers.
  */
-function omitReplacedExtensions(extensions: Extension[]): Extension[] {
+function omitReplacedExtensions(
+	extensions: Extension[],
+	warnings?: Array<{ path: string; warning: string }>,
+): Extension[] {
 	const names = (extension: Extension) => [
 		...[...extension.tools.keys()].map((name) => `tool:${name}`),
 		...[...extension.commands.keys()].map((name) => `command:${name}`),
 		...[...extension.flags.keys()].map((name) => `flag:${name}`),
 	];
-	const taken = new Set(extensions.filter((extension) => !extension.replaceable).flatMap(names));
-	return extensions.filter((extension) => !extension.replaceable || !names(extension).some((name) => taken.has(name)));
+	const taken = new Map(
+		extensions
+			.filter((extension) => !extension.replaceable)
+			.flatMap((extension) => names(extension).map((name) => [name, extension] as const)),
+	);
+	return extensions.filter((extension) => {
+		if (!extension.replaceable) return true;
+		const replacement = names(extension)
+			.map((name) => ({ name, extension: taken.get(name) }))
+			.find((value): value is { name: string; extension: Extension } => value.extension !== undefined);
+		if (!replacement) return true;
+		if (extension.path.startsWith(BUILTIN_PATH_PREFIX)) {
+			const builtinName = extension.path.slice(BUILTIN_PATH_PREFIX.length);
+			const [kind, rawName] = replacement.name.split(":", 2);
+			const registeredName = kind === "command" ? `/${rawName}` : kind === "flag" ? `--${rawName}` : rawName;
+			warnings?.push({
+				path: extension.path,
+				warning: `Extension ${replacement.extension.path} registers ${kind} \`${registeredName}\`, so built-in extension \`${builtinName}\` was not loaded. To use \`${builtinName}\`, run \`pi config\` and make sure it is enabled under Built-in extensions, then disable or remove the existing extension. We recommend only having one or the other loaded at a time.`,
+			});
+		}
+		return false;
+	});
 }
 
 export interface ResourceLoader {
@@ -229,8 +252,12 @@ export function loadProjectContextFiles(options: {
 
 	while (true) {
 		const contextFile = loadContextFileFromDir(currentDir);
+		// Compare the directory's real path, not the file's: a worktree AGENTS.md that
+		// symlinks to the main repo's file resolves to the shadowed path itself.
 		const isShadowed =
-			shadowedContextFile !== undefined && canonicalizePath(contextFile?.path ?? "") === shadowedContextFile;
+			shadowedContextFile !== undefined &&
+			contextFile !== null &&
+			join(canonicalizePath(currentDir), basename(contextFile.path)) === shadowedContextFile;
 		if (contextFile && !isShadowed && !seenPaths.has(contextFile.path)) {
 			ancestorContextFiles.unshift(contextFile);
 			seenPaths.add(contextFile.path);
@@ -257,6 +284,8 @@ export interface DefaultResourceLoaderOptions {
 	additionalThemePaths?: string[];
 	extensionFactories?: InlineExtension[];
 	noExtensions?: boolean;
+	/** Built-in extensions not to load, by name (such as `mcp`), even when settings or `-e` enable them. */
+	disabledBuiltinExtensions?: string[];
 	noSkills?: boolean;
 	noPromptTemplates?: boolean;
 	noThemes?: boolean;
@@ -296,6 +325,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private extensionFactories: InlineExtension[];
 	private builtinExtensions: Map<string, BuiltinExtension>;
 	private noExtensions: boolean;
+	private disabledBuiltinExtensions: Set<string>;
 	private noSkills: boolean;
 	private noPromptTemplates: boolean;
 	private noThemes: boolean;
@@ -361,6 +391,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.additionalPromptTemplatePaths = options.additionalPromptTemplatePaths ?? [];
 		this.additionalThemePaths = options.additionalThemePaths ?? [];
 		this.noExtensions = options.noExtensions ?? false;
+		this.disabledBuiltinExtensions = new Set(options.disabledBuiltinExtensions);
 		this.noSkills = options.noSkills ?? false;
 		this.noPromptTemplates = options.noPromptTemplates ?? false;
 		this.noThemes = options.noThemes ?? false;
@@ -543,9 +574,13 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const cliEnabledPrompts = getEnabledPaths(cliExtensionPaths.prompts);
 		const cliEnabledThemes = getEnabledPaths(cliExtensionPaths.themes);
 
-		const extensionPaths = this.noExtensions
-			? cliEnabledExtensions
-			: this.mergePaths(cliEnabledExtensions, enabledExtensions);
+		const extensionPaths = (
+			this.noExtensions ? cliEnabledExtensions : this.mergePaths(cliEnabledExtensions, enabledExtensions)
+		).filter(
+			(path) =>
+				!path.startsWith(BUILTIN_PATH_PREFIX) ||
+				!this.disabledBuiltinExtensions.has(path.slice(BUILTIN_PATH_PREFIX.length)),
+		);
 
 		const packageWarnings = collectExtensionPackageWarnings(extensionPaths, metadataByPath);
 		const extensionsResult = await this.loadFinalExtensionSet(extensionPaths, preTrustExtensions);
@@ -670,7 +705,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const inlineExtensions = await this.loadExtensionFactories(extensionsResult.runtime);
 		extensionsResult.extensions.push(...inlineExtensions.extensions);
 		extensionsResult.errors.push(...inlineExtensions.errors);
-		extensionsResult.extensions = omitReplacedExtensions(extensionsResult.extensions);
+		const replacementWarnings: Array<{ path: string; warning: string }> = [];
+		extensionsResult.extensions = omitReplacedExtensions(extensionsResult.extensions, replacementWarnings);
+		mergeExtensionWarnings(extensionsResult, replacementWarnings);
 		return extensionsResult;
 	}
 
@@ -743,12 +780,14 @@ export class DefaultResourceLoader implements ResourceLoader {
 			.filter((extension): extension is Extension => extension !== undefined);
 		orderedExtensions.push(...inlineExtensions.extensions);
 
+		const replacementWarnings: Array<{ path: string; warning: string }> = [];
 		const extensionsResult: LoadExtensionsResult = {
-			extensions: omitReplacedExtensions(orderedExtensions),
+			extensions: omitReplacedExtensions(orderedExtensions, replacementWarnings),
 			errors: [...(preTrustExtensions?.errors ?? []), ...remainingExtensions.errors, ...inlineExtensions.errors],
 			warnings: [...(preTrustExtensions?.warnings ?? []), ...(remainingExtensions.warnings ?? [])],
 			runtime: remainingExtensions.runtime,
 		};
+		mergeExtensionWarnings(extensionsResult, replacementWarnings);
 		this.addExtensionConflictDiagnostics(extensionsResult);
 		return extensionsResult;
 	}

@@ -42,9 +42,11 @@ export interface CodemodeTool {
 
 /**
  * One item of the script's output, in the order the script produced it: `text()` and `console.*`
- * produce text items, `image()` image items. `data` is base64.
+ * produce text items, with `console: true` for `console.*`, and `image()` image items. `data` is base64.
  */
-export type CodemodeOutputItem = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
+export type CodemodeOutputItem =
+	| { type: "text"; text: string; console?: true }
+	| { type: "image"; data: string; mimeType: string };
 
 export type CodemodeCallStatus = "ok" | "error" | "cancelled";
 
@@ -118,9 +120,10 @@ export interface CodemodeSandboxOptions {
 	/**
 	 * Worker entry that imports `@earendil-works/pi-codemode/worker`. Default: this package's own
 	 * worker file. Pass it when this package is bundled, since the default is resolved relative to
-	 * the module that creates the sandbox.
+	 * the module that creates the sandbox. Bun compiled executables require the relative string
+	 * specifier of an embedded build entrypoint; other hosts usually use a URL.
 	 */
-	workerUrl?: URL;
+	workerUrl?: string | URL;
 }
 
 export interface CodemodeExecuteOptions {

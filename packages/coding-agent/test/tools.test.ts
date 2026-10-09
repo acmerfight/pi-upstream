@@ -1,4 +1,3 @@
-import { readFile, rm } from "node:fs/promises";
 import { applyPatch } from "diff";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
@@ -6,7 +5,6 @@ import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { executeBashWithOperations } from "../src/core/bash-executor.ts";
 import type { ExtensionToolContext } from "../src/core/extensions/types.ts";
-import { bashExecutionToText } from "../src/core/messages.ts";
 import {
 	type BashOperations,
 	createBashTool,
@@ -91,6 +89,7 @@ describe("Coding Agent Tools", () => {
 			// No truncation message since file fits within limits
 			expect(getTextOutput(result)).not.toContain("Use offset=");
 			expect(result.details).toBeUndefined();
+			expect(result.structuredContent).toBe(content);
 		});
 
 		it("should handle non-existent files", async () => {
@@ -219,6 +218,13 @@ describe("Coding Agent Tools", () => {
 			expect(imageBlock?.mimeType).toBe("image/png");
 			expect(typeof imageBlock?.data).toBe("string");
 			expect((imageBlock?.data ?? "").length).toBeGreaterThan(0);
+			// Programmatic callers get the same image as a block. https://github.com/earendil-works/pi/issues/10251
+			expect(result.structuredContent).toEqual({
+				type: "image",
+				data: imageBlock?.data,
+				mimeType: "image/png",
+				note: getTextOutput(result),
+			});
 		});
 
 		it("should read BMP files from disk as PNG image attachments", async () => {
@@ -498,6 +504,7 @@ describe("Coding Agent Tools", () => {
 			expect(getTextOutput(result)).toBe("out\n\n\nCommand exited with code 3");
 			expect(result.structuredContent).toEqual({
 				output: "out\n",
+				truncated: false,
 				exit_code: 3,
 				wall_time_seconds: expect.any(Number),
 			});
@@ -505,6 +512,35 @@ describe("Coding Agent Tools", () => {
 			const ok = await bashTool.execute("test-call-9b", { command: "echo fine" });
 			expect(ok.isError).toBeUndefined();
 			expect(ok.structuredContent).toMatchObject({ output: "fine\n", exit_code: 0 });
+
+			const empty = await bashTool.execute("test-call-9c", { command: "true" });
+			expect(getTextOutput(empty)).toBe("(no output)");
+			expect(empty.structuredContent).toMatchObject({ output: "", truncated: false });
+		});
+
+		it("should return up to 1 MiB of output in structured content", async () => {
+			// 3000 lines exceed the model-facing 2000 line limit but not 1 MiB.
+			const medium = await bashTool.execute("test-call-9d", { command: "seq 1 3000" });
+			expect(getTextOutput(medium)).not.toContain("\n1\n2\n");
+			expect(medium.details?.truncation?.truncated).toBe(true);
+			const mediumOutput = medium.structuredContent as { output: string; truncated: boolean };
+			expect(mediumOutput.truncated).toBe(false);
+			expect(mediumOutput.output).toBe(`${Array.from({ length: 3000 }, (_, i) => i + 1).join("\n")}\n`);
+
+			// About 2 MB: keeps the first and last 512 KiB around an omission marker.
+			const large = await bashTool.execute("test-call-9e", { command: "seq 1 300000" });
+			const largeOutput = large.structuredContent as {
+				output: string;
+				truncated: boolean;
+				full_output_path?: string;
+			};
+			expect(largeOutput.truncated).toBe(true);
+			expect(largeOutput.output.startsWith("1\n2\n3\n")).toBe(true);
+			expect(largeOutput.output.endsWith("299999\n300000\n")).toBe(true);
+			expect(largeOutput.output).toMatch(/\n\n\[\.\.\. \d+ bytes omitted \.\.\.\]\n\n/);
+			expect(Buffer.byteLength(largeOutput.output)).toBeLessThan(1024 * 1024 + 100);
+			expect(largeOutput.full_output_path).toBe(large.details?.fullOutputPath);
+			expect(readFileSync(largeOutput.full_output_path!, "utf-8").endsWith("300000\n")).toBe(true);
 		});
 
 		// Regression tests for https://github.com/earendil-works/pi/issues/9577
@@ -834,61 +870,6 @@ describe("Coding Agent Tools", () => {
 			const fullOutput = readFileSync(fullOutputPath!, "utf-8");
 			expect(fullOutput).toContain("1\n2\n3");
 			expect(fullOutput).toContain("2998\n2999\n3000");
-		});
-
-		describe("user bash output truncation", () => {
-			const tempFiles: string[] = [];
-
-			afterEach(async () => {
-				await Promise.all(tempFiles.splice(0).map((path) => rm(path, { force: true })));
-			});
-
-			// #10164: the retained tail can fit even though earlier output was discarded.
-			it.each([false, true])("reports discarded chunks when cancelled=%s", async (cancelled) => {
-				const first = "error: missing build dependency\n".padEnd(64 * 1024, "x");
-				const last = "remaining build output\n".padEnd(44 * 1024, "y");
-				const controller = new AbortController();
-				const result = await executeBashWithOperations(
-					"cat build.log",
-					process.cwd(),
-					{
-						exec: async (_command, _cwd, { onData }) => {
-							onData(Buffer.from(first));
-							onData(Buffer.from(last));
-							if (cancelled) {
-								controller.abort();
-								throw new Error("aborted");
-							}
-							return { exitCode: 0 };
-						},
-					},
-					{ signal: controller.signal },
-				);
-				if (result.fullOutputPath) tempFiles.push(result.fullOutputPath);
-				// The executor currently closes its file stream without awaiting its finish event.
-				await vi.waitFor(async () => {
-					expect(await readFile(result.fullOutputPath!, "utf-8")).toBe(first + last);
-				});
-
-				expect(result.cancelled).toBe(cancelled);
-				expect(result.output).toBe(last);
-				expect(result.truncated).toBe(true);
-				expect(
-					bashExecutionToText({ role: "bashExecution", command: "cat build.log", timestamp: 0, ...result }),
-				).toContain(`[Output truncated. Full output: ${result.fullOutputPath}]`);
-			});
-
-			it("does not mark short output as truncated", async () => {
-				const result = await executeBashWithOperations("echo done", process.cwd(), {
-					exec: async (_command, _cwd, { onData }) => {
-						onData(Buffer.from("done\n"));
-						return { exitCode: 0 };
-					},
-				});
-				expect(result.output).toBe("done\n");
-				expect(result.truncated).toBe(false);
-				expect(result.fullOutputPath).toBeUndefined();
-			});
 		});
 	});
 

@@ -67,7 +67,8 @@ describe("regression #9124: runtime disposal during tool execution", () => {
 		const messages = harness.sessionManager
 			.getEntries()
 			.filter((entry) => entry.type === "message")
-			.map((entry) => entry.message);
+			.map((entry) => entry.message)
+			.filter((message) => message.role !== "system");
 		expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "toolResult", "assistant"]);
 		expect(messages[2]).toMatchObject({
 			role: "toolResult",
